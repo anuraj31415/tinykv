@@ -1,8 +1,14 @@
 """A small key-value store backed by a write-ahead log."""
 import os
+import shutil
 import struct
 import zlib
 from typing import Dict, Iterator, Union
+
+try:
+    import fcntl
+except ImportError:  # not POSIX
+    fcntl = None
 
 Value = Union[bytes, str]
 
@@ -16,12 +22,8 @@ _OPS = (OP_SET_BYTES, OP_SET_STR, OP_DELETE)
 _HEADER = struct.Struct(">IBII")
 _CRC_SIZE = 4
 
-# Sanity limit so a corrupt length field can't make us read gigabytes.
+# Keys and values over this size are refused on write and treated as garbage on replay.
 MAX_FIELD = 1 << 30
-
-
-class CorruptLogError(Exception):
-    pass
 
 
 def encode_record(op: int, key: bytes, value: bytes = b"") -> bytes:
@@ -30,7 +32,11 @@ def encode_record(op: int, key: bytes, value: bytes = b"") -> bytes:
 
 
 def _read_records(data: bytes):
-    """Yield (end_offset, op, key, value) for each good record, stopping at the first bad one."""
+    """Yield (end_offset, op, key, value) for each good record, stopping at the first bad one.
+
+    value is a str for OP_SET_STR and bytes otherwise. A record whose crc is fine but whose
+    key or str value is not valid utf-8 counts as a bad record.
+    """
     pos = 0
     n = len(data)
     while pos + _HEADER.size <= n:
@@ -43,7 +49,14 @@ def _read_records(data: bytes):
         if zlib.crc32(data[pos + _CRC_SIZE:end]) != crc:
             return
         kstart = pos + _HEADER.size
-        yield end, op, data[kstart:kstart + klen], data[kstart + klen:end]
+        try:
+            key = data[kstart:kstart + klen].decode("utf-8")
+            value = data[kstart + klen:end]
+            if op == OP_SET_STR:
+                value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        yield end, op, key, value
         pos = end
 
 
@@ -58,33 +71,68 @@ def _fsync_dir(path: str) -> None:
 
 
 class Store:
+    """Key-value store with a write-ahead log.
+
+    Not thread-safe. Use one Store per file and one process per file. On POSIX a second
+    open of the same file fails fast (BlockingIOError) instead of cutting into a live writer.
+    Iterating takes a snapshot of the keys, so mutating while iterating is fine.
+    """
+
     def __init__(self, path: str, compact_threshold: int = 1 << 20):
         self.path = os.fspath(path)
         self.compact_threshold = compact_threshold
         self._tmp_path = self.path + ".compact"
+        self._lock_path = self.path + ".lock"
         self._data: Dict[str, Value] = {}
         self._live_size = 0
         self._sizes: Dict[str, int] = {}
         self._log_size = 0
         self._f = None
+        self._lock = None
+        self._broken = False
         self._open()
 
     # recovery
 
     def _open(self) -> None:
+        self._acquire_lock()
+        try:
+            self._replay()
+        except BaseException:
+            self._release_lock()
+            raise
+
+    def _acquire_lock(self) -> None:
+        if fcntl is None:
+            return
+        f = open(self._lock_path, "ab")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            raise
+        self._lock = f
+
+    def _release_lock(self) -> None:
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
+
+    def _replay(self) -> None:
         # A leftover temp file means a crash during compaction before the rename.
         # The real log is still complete, so the temp file is just thrown away.
         if os.path.exists(self._tmp_path):
             os.remove(self._tmp_path)
 
+        existed = os.path.exists(self.path)
         data = b""
-        if os.path.exists(self.path):
+        if existed:
             with open(self.path, "rb") as f:
                 data = f.read()
 
         good = 0
         for end, op, key, value in _read_records(data):
-            self._apply(op, key.decode("utf-8"), value, end - good)
+            self._apply(op, key, value, end - good)
             good = end
 
         self._f = open(self.path, "ab")
@@ -94,15 +142,15 @@ class Store:
             self._f.flush()
             os.fsync(self._f.fileno())
         self._log_size = good
-        if not data:
+        if not existed:
             _fsync_dir(os.path.dirname(os.path.abspath(self.path)))
 
-    def _apply(self, op: int, key: str, value: bytes, size: int) -> None:
+    def _apply(self, op: int, key: str, value: Value, size: int) -> None:
         self._live_size -= self._sizes.pop(key, 0)
         if op == OP_DELETE:
             self._data.pop(key, None)
         else:
-            self._data[key] = value.decode("utf-8") if op == OP_SET_STR else value
+            self._data[key] = value
             self._sizes[key] = size
             self._live_size += size
 
@@ -117,9 +165,12 @@ class Store:
             op, raw = OP_SET_BYTES, bytes(value)
         else:
             raise TypeError("value must be bytes or str")
-        rec = encode_record(op, key.encode("utf-8"), raw)
+        rawkey = key.encode("utf-8")
+        if len(rawkey) > MAX_FIELD or len(raw) > MAX_FIELD:
+            raise ValueError("key or value is too large")
+        rec = encode_record(op, rawkey, raw)
         self._append(rec)
-        self._apply(op, key, raw, len(rec))
+        self._apply(op, key, value if op == OP_SET_STR else raw, len(rec))
         self._maybe_compact()
 
     def get(self, key: str, default=None):
@@ -147,45 +198,84 @@ class Store:
         return len(self._data)
 
     def _append(self, rec: bytes) -> None:
-        self._f.write(rec)
-        self._f.flush()
-        os.fsync(self._f.fileno())
+        if self._broken or self._f is None:
+            raise ValueError("store is closed or broken")
+        try:
+            self._f.write(rec)
+            self._f.flush()
+            os.fsync(self._f.fileno())
+        except BaseException:
+            self._undo_append()
+            raise
         self._log_size += len(rec)
+
+    def _undo_append(self) -> None:
+        """A failed append may have left part of a record in the file. Cut it off, because
+        otherwise later (acknowledged) records would sit behind garbage and be lost on replay."""
+        try:
+            try:
+                self._f.close()
+            except OSError:
+                pass
+            os.truncate(self.path, self._log_size)
+            self._f = open(self.path, "ab")
+            os.fsync(self._f.fileno())
+        except OSError:
+            self._broken = True
 
     # compaction
 
     def _maybe_compact(self) -> None:
         if self._log_size > self.compact_threshold and self._log_size > 2 * self._live_size:
-            self.compact()
+            try:
+                self.compact()
+            except OSError:
+                pass  # the write already succeeded; compaction is retried on a later write
 
     def compact(self) -> None:
         """Rewrite the log so it holds only live keys, atomically."""
+        if self._broken or self._f is None:
+            raise ValueError("store is closed or broken")
         sizes = {}
-        with open(self._tmp_path, "wb") as tmp:
-            for key, value in self._data.items():
-                if isinstance(value, str):
-                    rec = encode_record(OP_SET_STR, key.encode("utf-8"), value.encode("utf-8"))
-                else:
-                    rec = encode_record(OP_SET_BYTES, key.encode("utf-8"), value)
-                tmp.write(rec)
-                sizes[key] = len(rec)
-            tmp.flush()
-            os.fsync(tmp.fileno())
+        try:
+            with open(self._tmp_path, "wb") as tmp:
+                for key, value in self._data.items():
+                    if isinstance(value, str):
+                        rec = encode_record(OP_SET_STR, key.encode("utf-8"), value.encode("utf-8"))
+                    else:
+                        rec = encode_record(OP_SET_BYTES, key.encode("utf-8"), value)
+                    tmp.write(rec)
+                    sizes[key] = len(rec)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            try:
+                shutil.copymode(self.path, self._tmp_path)
+            except OSError:
+                pass
+        except BaseException:
+            try:
+                os.remove(self._tmp_path)
+            except OSError:
+                pass
+            raise
         self._f.close()
         try:
             os.replace(self._tmp_path, self.path)
+            # The new log is in place, so the bookkeeping must match it even if the
+            # directory fsync below fails.
+            self._sizes = sizes
+            self._live_size = sum(sizes.values())
+            self._log_size = self._live_size
             _fsync_dir(os.path.dirname(os.path.abspath(self.path)))
         finally:
             # Whether or not the rename happened, reopen whatever is at self.path.
             self._f = open(self.path, "ab")
-        self._sizes = sizes
-        self._live_size = sum(sizes.values())
-        self._log_size = self._live_size
 
     def close(self) -> None:
         if self._f is not None:
             self._f.close()
             self._f = None
+        self._release_lock()
 
     def __enter__(self):
         return self

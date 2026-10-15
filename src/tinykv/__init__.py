@@ -1,3 +1,3 @@
-from .store import CorruptLogError, Store
+from .store import Store
 
-__all__ = ["Store", "CorruptLogError"]
+__all__ = ["Store"]

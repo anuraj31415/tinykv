@@ -21,6 +21,10 @@ The crc32 covers everything after the crc field: op, both lengths, key and value
 
 `set` and `delete` encode one record, write it to the end of the file, flush, and call fsync. Only then does the call return and the in-memory dict change. A delete of a key that doesn't exist writes nothing.
 
+Keys and values over 1 GiB are refused with `ValueError`, because replay would reject such a record and cut the log there.
+
+If the write or the fsync fails (disk full, I/O error), part of the record may already be in the file. The store cuts the file back to its size before the append, so later writes don't end up behind garbage. The call raises and the dict is not changed. If even that cleanup fails, the store marks itself broken and refuses further writes.
+
 ## Recovery
 
 On open the whole log is read and records are applied in order. A record is accepted only if all of these hold:
@@ -29,12 +33,13 @@ On open the whole log is read and records are applied in order. A record is acce
 - the op is one of the three known ones, and the lengths are under a sanity limit (1 GiB), so a garbage length can't make us try to read something huge
 - the bytes the header promises are all there
 - the crc matches
+- the key, and the value of a str record, are valid utf-8 (a record that passes the crc but not this is treated as bad)
 
-At the first record that fails any check, replay stops. The file is truncated to the end of the last good record and fsynced, so the next append starts on a clean boundary. A crash while appending can only damage the end of the file, so in the normal case this drops exactly the one record that was being written, and that call never returned to its caller anyway.
+At the first record that fails any check, replay stops. The file is physically truncated to the end of the last good record and fsynced, so the next append starts on a clean boundary. A crash while appending can only damage the end of the file, so in the normal case this drops exactly the one record that was being written, and that call never returned to its caller anyway.
 
-If the damage is in the middle of the log (bit rot, not a torn write), the same rule applies: everything from the first bad record on is dropped. There's no resync, because after a bad length field there's no safe way to find the next record start. This is a deliberate choice and it can lose data that was fine, but it never applies a record it can't verify.
+If the damage is in the middle of the log (bit rot, not a torn write), the same rule applies: everything from the first bad record on is deleted from the file, not just ignored in memory, so later intact records are destroyed on disk. There's no resync, because after a bad length field there's no safe way to find the next record start. This is a deliberate choice and it can lose data that was fine, but it never applies a record it can't verify.
 
-A torn tail that happens to leave a valid-looking prefix is caught by the crc. The tests cut the log at every byte offset of a small log and check that the store comes back with exactly the complete records each time.
+A torn tail that happens to leave a valid-looking prefix is caught by the length check (complete header, missing payload) or by the crc. The tests cut the log at every byte offset of a small log and check that the store comes back with exactly the complete records each time.
 
 ## Compaction
 
@@ -45,12 +50,16 @@ When the log is bigger than `compact_threshold` and also more than twice the siz
 3. `os.replace` it over the log. Rename is atomic on POSIX, so the path points at either the old complete log or the new complete one, never a mix.
 4. fsync the directory so the rename itself survives a power cut.
 
-A crash before step 3 leaves the old log untouched, plus a stray `.compact` file. On open the stray file is deleted without being read, since the real log is already complete. A crash after step 3 leaves the new log, which is a normal log. The old log is never modified in place, so there is no point at which the data exists only in a half-written file.
+A crash before step 3 leaves the old log untouched, plus a stray `.compact` file. On open the stray file is deleted without being read, since the real log is already complete. A crash after step 3 leaves the new log, which is a normal log. A power cut between the rename and the directory fsync may leave the directory pointing at either file, and both are complete. Nothing is written to the new file before the directory fsync, so no acknowledged write can be lost this way.
+
+If compaction fails when it was triggered automatically by a `set` or `delete`, the error is swallowed because the write itself already succeeded, and compaction is tried again later. A direct `compact()` call raises. The temp file is removed if writing it fails. The file mode of the old log is copied to the new one before the rename. The old log is never modified in place, so there is no point at which the data exists only in a half-written file.
 
 The `.compact` file is also not trusted if it looks fine, because we can't tell a finished one from one that stopped right at a record boundary before the fsync.
 
 ## Limits
 
 - Everything lives in memory, so the data set has to fit in RAM.
-- One process at a time. There is no file locking.
+- Not thread-safe. Use one `Store` per file, in one process.
+- On POSIX a second open of the same file fails fast, using an flock on `<log>.lock`. Without that, a second opener would truncate the tail and delete `.compact`, which could cut into a live writer's record. On other systems there is no lock.
 - Directory fsync is skipped on non-POSIX systems.
+- The new log after compaction keeps the old file's mode but not its owner.
